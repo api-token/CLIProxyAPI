@@ -316,3 +316,106 @@ func TestManagerSoonestResetIgnoresCooldownOnRemappedAlias(t *testing.T) {
 		t.Fatalf("SelectAuth() = %q, want %q", got.ID, sooner)
 	}
 }
+
+func TestWeeklyQuotaResetAtFallsBackToPersistedMetadata(t *testing.T) {
+	t.Parallel()
+
+	persisted := time.Unix(1793462400, 0)
+	auth := &Auth{Metadata: map[string]any{WeeklyQuotaResetMetadataKey: persisted.UTC().Format(time.RFC3339)}}
+	if got, ok := WeeklyQuotaResetAt(auth); !ok || !got.Equal(persisted) {
+		t.Fatalf("WeeklyQuotaResetAt() = %v, %v; want persisted %v", got, ok, persisted)
+	}
+
+	observed := persisted.Add(7 * 24 * time.Hour)
+	auth.Quota.Signals = map[string]string{"Anthropic-Ratelimit-Unified-7d-Reset": strconv.FormatInt(observed.Unix(), 10)}
+	if got, ok := WeeklyQuotaResetAt(auth); !ok || !got.Equal(observed) {
+		t.Fatalf("WeeklyQuotaResetAt() = %v, %v; want observed %v to win", got, ok, observed)
+	}
+
+	malformed := &Auth{Metadata: map[string]any{WeeklyQuotaResetMetadataKey: "next tuesday"}}
+	if _, ok := WeeklyQuotaResetAt(malformed); ok {
+		t.Fatal("WeeklyQuotaResetAt() accepted malformed persisted metadata")
+	}
+}
+
+func TestSyncWeeklyQuotaResetMetadata(t *testing.T) {
+	t.Parallel()
+
+	observedAt := time.Unix(1_793_000_000, 0)
+	auth := &Auth{Metadata: map[string]any{"type": "codex"}, Quota: QuotaState{ObservedAt: observedAt, Signals: map[string]string{
+		"X-Codex-Primary-Window-Minutes":      "10080",
+		"X-Codex-Primary-Reset-After-Seconds": "3600",
+	}}}
+	syncWeeklyQuotaResetMetadata(auth)
+	want := observedAt.Add(time.Hour).UTC().Format(time.RFC3339)
+	if got := auth.Metadata[WeeklyQuotaResetMetadataKey]; got != want {
+		t.Fatalf("metadata = %v, want %s", got, want)
+	}
+
+	// A relative header observed a few seconds later drifts slightly; keep the stored value.
+	auth.Quota.ObservedAt = observedAt.Add(5 * time.Second)
+	syncWeeklyQuotaResetMetadata(auth)
+	if got := auth.Metadata[WeeklyQuotaResetMetadataKey]; got != want {
+		t.Fatalf("metadata rewritten for drift: %v, want %s", got, want)
+	}
+
+	// The next week's window replaces it.
+	auth.Quota.ObservedAt = observedAt.Add(7 * 24 * time.Hour)
+	syncWeeklyQuotaResetMetadata(auth)
+	next := observedAt.Add(7*24*time.Hour + time.Hour).UTC().Format(time.RFC3339)
+	if got := auth.Metadata[WeeklyQuotaResetMetadataKey]; got != next {
+		t.Fatalf("metadata = %v, want %s", got, next)
+	}
+
+	// Auths without metadata are never persisted, so none is created.
+	runtimeOnly := &Auth{Quota: auth.Quota}
+	syncWeeklyQuotaResetMetadata(runtimeOnly)
+	if runtimeOnly.Metadata != nil {
+		t.Fatalf("metadata created for runtime-only auth: %v", runtimeOnly.Metadata)
+	}
+}
+
+func TestManagerMarkResultRecordsWeeklyResetInMetadata(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       "weekly-reset-metadata-auth",
+		Provider: "claude",
+		Metadata: map[string]any{"type": "claude"},
+	})
+	if errRegister != nil || auth == nil {
+		t.Fatalf("Register() auth=%#v err=%v", auth, errRegister)
+	}
+	ctx := internallogging.WithResponseHeadersHolder(context.Background())
+	internallogging.SetResponseHeaders(ctx, http.Header{
+		"Anthropic-Ratelimit-Unified-7d-Reset":  []string{"1793462400"},
+		"Anthropic-Ratelimit-Unified-7d-Status": []string{"allowed"},
+	})
+	manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: "claude", Model: "claude-test", Success: true})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("auth not found after MarkResult")
+	}
+	if got, want := updated.Metadata[WeeklyQuotaResetMetadataKey], time.Unix(1793462400, 0).UTC().Format(time.RFC3339); got != want {
+		t.Fatalf("metadata[%s] = %v, want %s", WeeklyQuotaResetMetadataKey, got, want)
+	}
+}
+
+// After a restart only the persisted metadata is known; no probe request is needed.
+func TestSoonestResetSelectorPick_UsesPersistedResetsAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	now := time.Unix(1_793_400_000, 0)
+	persisted := func(id string, resetAt time.Time) *Auth {
+		return &Auth{ID: id, Provider: "claude", Status: StatusActive, Metadata: map[string]any{
+			WeeklyQuotaResetMetadataKey: resetAt.UTC().Format(time.RFC3339),
+		}}
+	}
+	auths := []*Auth{
+		persisted("claude-823", now.Add(56*time.Hour)),
+		persisted("claude-8e9", now.Add(17*time.Hour)),
+	}
+	if got := pickSoonestReset(t, now, auths); got != "claude-8e9" {
+		t.Fatalf("Pick() = %q, want claude-8e9", got)
+	}
+}

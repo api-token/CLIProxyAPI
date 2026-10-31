@@ -11,8 +11,16 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
-// weeklyWindowMinutes is the length of the subscription windows this selector ranks by.
-const weeklyWindowMinutes = 7 * 24 * 60
+const (
+	// weeklyWindowMinutes is the length of the subscription windows this selector ranks by.
+	weeklyWindowMinutes = 7 * 24 * 60
+	// WeeklyQuotaResetMetadataKey stores the last observed weekly reset (RFC 3339) in the
+	// auth file, so the ranking survives a restart before any new response is observed.
+	WeeklyQuotaResetMetadataKey = "weekly_quota_reset_at"
+	// weeklyQuotaResetPersistTolerance absorbs reset times derived from relative headers,
+	// which shift by a second or so per response, so the auth file is not rewritten each time.
+	weeklyQuotaResetPersistTolerance = time.Minute
+)
 
 // SoonestResetSelector is fill-first ordered by weekly quota reset time instead of ID.
 // The credential whose weekly window resets soonest is drained first, so quota that is
@@ -21,7 +29,8 @@ const weeklyWindowMinutes = 7 * 24 * 60
 // The reset time comes from the passive quota snapshot recorded on every upstream
 // response (Anthropic unified 7d headers, Codex 10080-minute window headers).
 // Credentials without a known future reset are tried first so one request learns their
-// window; credentials sharing a reset time keep the fill-first ID order.
+// window; credentials sharing a reset time keep the fill-first ID order. The last observed
+// reset is also kept in auth metadata, which covers the time after a restart.
 type SoonestResetSelector struct {
 	// nowFunc overrides the clock in tests.
 	nowFunc func() time.Time
@@ -59,13 +68,55 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 	return available[0], nil
 }
 
-// WeeklyQuotaResetAt reports when the credential's weekly quota window next resets,
-// as last observed in upstream response headers.
+// WeeklyQuotaResetAt reports when the credential's weekly quota window next resets, as
+// last observed in upstream response headers, or as persisted in auth metadata when no
+// response has been observed since the auth was loaded.
 func WeeklyQuotaResetAt(auth *Auth) (time.Time, bool) {
-	if auth == nil || len(auth.Quota.Signals) == 0 {
+	if auth == nil {
 		return time.Time{}, false
 	}
+	if resetAt, ok := observedWeeklyQuotaResetAt(auth); ok {
+		return resetAt, true
+	}
+	return persistedWeeklyQuotaResetAt(auth)
+}
+
+// syncWeeklyQuotaResetMetadata copies a newly observed weekly reset into the metadata the
+// auth store persists. Auths without metadata (config API keys, runtime-only) are skipped.
+func syncWeeklyQuotaResetMetadata(auth *Auth) {
+	if auth == nil || auth.Metadata == nil {
+		return
+	}
+	resetAt, ok := observedWeeklyQuotaResetAt(auth)
+	if !ok {
+		return
+	}
+	if persisted, okPersisted := persistedWeeklyQuotaResetAt(auth); okPersisted {
+		delta := resetAt.Sub(persisted)
+		if delta > -weeklyQuotaResetPersistTolerance && delta < weeklyQuotaResetPersistTolerance {
+			return
+		}
+	}
+	auth.Metadata[WeeklyQuotaResetMetadataKey] = resetAt.UTC().Format(time.RFC3339)
+}
+
+func persistedWeeklyQuotaResetAt(auth *Auth) (time.Time, bool) {
+	raw, ok := auth.Metadata[WeeklyQuotaResetMetadataKey].(string)
+	if !ok {
+		return time.Time{}, false
+	}
+	resetAt, errParse := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	if errParse != nil {
+		return time.Time{}, false
+	}
+	return resetAt, true
+}
+
+func observedWeeklyQuotaResetAt(auth *Auth) (time.Time, bool) {
 	signals := auth.Quota.Signals
+	if len(signals) == 0 {
+		return time.Time{}, false
+	}
 	if resetAt, ok := unixSignal(signals, "Anthropic-Ratelimit-Unified-7d-Reset"); ok {
 		return resetAt, true
 	}
