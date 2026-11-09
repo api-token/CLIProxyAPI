@@ -28,8 +28,9 @@ const (
 // The reset time comes from the passive quota snapshot recorded on every upstream
 // response (Anthropic unified 7d headers, Codex 10080-minute window headers).
 // Credentials without a known future reset are tried first until a response completes
-// and teaches their window. A credential that answers without reporting a weekly window
-// has nothing that expires, so it is then spent last. Credentials that rank equally keep
+// and teaches their window. A credential that answers without reporting a weekly window,
+// or without renewing one that has elapsed, has nothing that expires, so it is then
+// spent last. Credentials that rank equally keep
 // the fill-first ID order. The last observed reset is also kept in auth metadata, which
 // covers the time after a restart.
 type SoonestResetSelector struct {
@@ -71,7 +72,7 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 const (
 	weeklyResetTierProbe = iota // reset unknown or rolled over: try first to learn it
 	weeklyResetTierKnown        // known future reset: soonest first
-	weeklyResetTierNone         // answered without a weekly window: spend last
+	weeklyResetTierNone         // answered since without a future reset: spend last
 )
 
 // weeklyResetRank orders candidates by tier, then by reset time within the known tier.
@@ -81,11 +82,12 @@ type weeklyResetRank struct {
 }
 
 func rankWeeklyReset(auth *Auth, now time.Time) weeklyResetRank {
+	// resetAt is zero when unknown, so any probe is after it.
 	resetAt, ok := weeklyQuotaResetAt(auth)
 	switch {
 	case ok && resetAt.After(now):
 		return weeklyResetRank{tier: weeklyResetTierKnown, resetAt: resetAt}
-	case !ok && auth.weeklyResetProbed:
+	case auth.weeklyResetProbedAt.After(resetAt):
 		return weeklyResetRank{tier: weeklyResetTierNone}
 	default:
 		return weeklyResetRank{tier: weeklyResetTierProbe}

@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -53,15 +53,11 @@ func TestFileTokenStoreWeeklyResetSurvivesRestart(t *testing.T) {
 		if errRead != nil {
 			t.Fatal(errRead)
 		}
-		var onDisk map[string]any
-		if errUnmarshal := json.Unmarshal(raw, &onDisk); errUnmarshal != nil {
-			t.Fatal(errUnmarshal)
-		}
-		if got, want := onDisk[cliproxyauth.WeeklyQuotaResetMetadataKey], resetAt.UTC().Format(time.RFC3339); got != want {
+		if got, want := ojson.GetBytesNoCopy(raw, cliproxyauth.WeeklyQuotaResetMetadataKey).String(), resetAt.UTC().Format(time.RFC3339); got != want {
 			t.Fatalf("%s %s = %v, want %s", name, cliproxyauth.WeeklyQuotaResetMetadataKey, got, want)
 		}
-		if onDisk["email"] != name {
-			t.Fatalf("%s lost existing fields: %v", name, onDisk)
+		if ojson.GetBytesNoCopy(raw, "email").String() != name {
+			t.Fatalf("%s lost existing fields: %s", name, raw)
 		}
 	}
 
@@ -112,16 +108,12 @@ func TestFileTokenStoreWeeklyResetPersistsCodexAuth(t *testing.T) {
 	if errRead != nil {
 		t.Fatal(errRead)
 	}
-	var onDisk map[string]any
-	if errUnmarshal := json.Unmarshal(raw, &onDisk); errUnmarshal != nil {
-		t.Fatal(errUnmarshal)
-	}
-	if got, want := onDisk[cliproxyauth.WeeklyQuotaResetMetadataKey], resetAt.UTC().Format(time.RFC3339); got != want {
+	if got, want := ojson.GetBytesNoCopy(raw, cliproxyauth.WeeklyQuotaResetMetadataKey).String(), resetAt.UTC().Format(time.RFC3339); got != want {
 		t.Fatalf("%s = %v, want %s", cliproxyauth.WeeklyQuotaResetMetadataKey, got, want)
 	}
 	for key, want := range map[string]string{"access_token": "at", "refresh_token": "rt", "account_id": "acct", "email": "user@example.com"} {
-		if onDisk[key] != want {
-			t.Fatalf("%s = %v, want %s; file %s", key, onDisk[key], want, raw)
+		if got := ojson.GetBytesNoCopy(raw, key).String(); got != want {
+			t.Fatalf("%s = %v, want %s; file %s", key, got, want, raw)
 		}
 	}
 }

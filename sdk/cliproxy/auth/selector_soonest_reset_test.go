@@ -314,6 +314,11 @@ func TestManagerSoonestResetSpendsCredentialWithoutWeeklyWindowLast(t *testing.T
 	// A success that skips quota observation (token counting) teaches nothing, so it must
 	// not mark the weekly credential as one that reports no window.
 	manager.MarkResult(context.Background(), Result{AuthID: weekly, Provider: "claude", Model: model, Success: true, SkipQuotaObservation: true})
+	// Neither does a failure, which may carry no quota headers at all.
+	manager.MarkResult(context.Background(), Result{
+		AuthID: weekly, Provider: "claude", Model: model,
+		Error: &Error{HTTPStatus: http.StatusBadRequest, Message: "bad request"},
+	})
 
 	// ID order probes a-silent, which answers without a window; b-weekly is probed next and
 	// keeps the traffic from then on.
@@ -326,6 +331,59 @@ func TestManagerSoonestResetSpendsCredentialWithoutWeeklyWindowLast(t *testing.T
 		if got := string(resp.Payload); got != wantID {
 			t.Fatalf("Execute #%d routed to %q, want %q", i, got, wantID)
 		}
+	}
+
+	// An update that replaces the auth (a reloaded auth file, say) must not make a-silent
+	// look unprobed again.
+	if _, errUpdate := manager.Update(context.Background(), &Auth{ID: silent, Provider: "claude", Status: StatusActive}); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	got, errSelect := manager.SelectAuth(context.Background(), "claude", model, cliproxyexecutor.Options{})
+	if errSelect != nil {
+		t.Fatal(errSelect)
+	}
+	if got.ID != weekly {
+		t.Fatalf("SelectAuth() after Update = %q, want %q", got.ID, weekly)
+	}
+}
+
+// A credential whose weekly reset has elapsed gets one probe. If it answers without a new
+// reset (a plan change, say), it must stop ranking first, whether the stale reset is the
+// observed signal or only the persisted metadata.
+func TestManagerSoonestResetStopsProbingCredentialThatDropsWeeklyWindow(t *testing.T) {
+	for _, source := range []string{"observed", "persisted"} {
+		t.Run(source, func(t *testing.T) {
+			model := "soonest-reset-stale-model-" + source
+			manager := NewManager(nil, &SoonestResetSelector{}, nil)
+			manager.SetRetryConfig(0, 0, 0)
+			stale, weekly := "a-stale-"+t.Name(), "b-weekly-"+t.Name()
+			now := time.Now()
+			elapsed := now.Add(-time.Hour)
+			staleAuth := claudeWeeklyResetAuth(stale, elapsed)
+			if source == "persisted" {
+				staleAuth = &Auth{ID: stale, Provider: "claude", Status: StatusActive, Metadata: map[string]any{
+					WeeklyQuotaResetMetadataKey: elapsed.UTC().Format(time.RFC3339),
+				}}
+			}
+			registerSoonestResetAuths(t, manager, model, staleAuth, claudeWeeklyResetAuth(weekly, now.Add(2*time.Hour)))
+			manager.RegisterExecutor(&mockCustomErrorExecutor{
+				identifier: "claude",
+				executeFn: func(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+				},
+			})
+
+			want := []string{stale, weekly, weekly}
+			for i, wantID := range want {
+				resp, errExecute := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				if errExecute != nil {
+					t.Fatalf("Execute #%d error = %v", i, errExecute)
+				}
+				if got := string(resp.Payload); got != wantID {
+					t.Fatalf("Execute #%d routed to %q, want %q", i, got, wantID)
+				}
+			}
+		})
 	}
 }
 

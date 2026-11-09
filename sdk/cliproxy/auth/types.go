@@ -146,10 +146,10 @@ type Auth struct {
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
 
-	// weeklyResetProbed reports that a response which could have carried quota headers
-	// has succeeded since this auth was loaded, so a still-unknown weekly reset means
-	// the credential does not report one. Runtime only.
-	weeklyResetProbed bool `json:"-"`
+	// weeklyResetProbedAt is when a response that could have carried quota headers last
+	// succeeded. A weekly reset that is still unknown or elapsed after it means the
+	// credential does not report one. Runtime only.
+	weeklyResetProbedAt time.Time `json:"-"`
 
 	// cooldownRecordedSeq is the execution sequence watermark captured when
 	// the current auth-level cooldown was recorded. Successes from executions
