@@ -96,6 +96,27 @@ func TestSoonestResetSelectorPick_ElapsedResetRanksFirst(t *testing.T) {
 	if got := pickSoonestReset(t, now, auths[:2]); got != "b-unknown" {
 		t.Fatalf("Pick() = %q, want b-unknown", got)
 	}
+
+	// A response that completed before the reset, or just after it while still carrying
+	// the old reset, is not a probe of the new window. One well after the reset is, so a
+	// credential that still reports no future reset then goes last.
+	for _, tt := range []struct {
+		name     string
+		resetAt  time.Time
+		probedAt time.Time
+		want     string
+	}{
+		{name: "probed before the reset", resetAt: now.Add(-time.Minute), probedAt: now.Add(-time.Hour), want: "a-rolled-over"},
+		{name: "response straddled the reset", resetAt: now.Add(-time.Minute), probedAt: now.Add(-30 * time.Second), want: "a-rolled-over"},
+		{name: "probed well after the reset", resetAt: now.Add(-time.Hour), probedAt: now.Add(-30 * time.Minute), want: "b-pending"},
+	} {
+		rolledOver := claudeWeeklyResetAuth("a-rolled-over", tt.resetAt)
+		rolledOver.weeklyResetProbedAt = tt.probedAt
+		auths = []*Auth{rolledOver, claudeWeeklyResetAuth("b-pending", now.Add(time.Hour))}
+		if got := pickSoonestReset(t, now, auths); got != tt.want {
+			t.Fatalf("%s: Pick() = %q, want %q", tt.name, got, tt.want)
+		}
+	}
 }
 
 func TestSoonestResetSelectorPick_TiesKeepFillFirstOrder(t *testing.T) {

@@ -19,6 +19,10 @@ const (
 	// weeklyQuotaResetPersistTolerance absorbs reset times derived from relative headers,
 	// which shift by a second or so per response, so the auth file is not rewritten each time.
 	weeklyQuotaResetPersistTolerance = time.Minute
+	// weeklyResetProbeGrace is how long after a reset a completed response still does not
+	// count as a probe of the new window. A response that began before the reset can
+	// finish just after it while carrying the old reset time.
+	weeklyResetProbeGrace = 15 * time.Minute
 )
 
 // SoonestResetSelector is fill-first ordered by weekly quota reset time instead of ID.
@@ -30,9 +34,8 @@ const (
 // Credentials without a known future reset are tried first until a response completes
 // and teaches their window. A credential that answers without reporting a weekly window,
 // or without renewing one that has elapsed, has nothing that expires, so it is then
-// spent last. Credentials that rank equally keep
-// the fill-first ID order. The last observed reset is also kept in auth metadata, which
-// covers the time after a restart.
+// spent last. Credentials that rank equally keep the fill-first ID order. The last
+// observed reset is also kept in auth metadata, which covers the time after a restart.
 type SoonestResetSelector struct {
 	// nowFunc overrides the clock in tests.
 	nowFunc func() time.Time
@@ -87,7 +90,7 @@ func rankWeeklyReset(auth *Auth, now time.Time) weeklyResetRank {
 	switch {
 	case ok && resetAt.After(now):
 		return weeklyResetRank{tier: weeklyResetTierKnown, resetAt: resetAt}
-	case auth.weeklyResetProbedAt.After(resetAt):
+	case auth.weeklyResetProbedAt.After(resetAt.Add(weeklyResetProbeGrace)):
 		return weeklyResetRank{tier: weeklyResetTierNone}
 	default:
 		return weeklyResetRank{tier: weeklyResetTierProbe}
