@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,9 +27,11 @@ const (
 //
 // The reset time comes from the passive quota snapshot recorded on every upstream
 // response (Anthropic unified 7d headers, Codex 10080-minute window headers).
-// Credentials without a known future reset are tried first so one request learns their
-// window; credentials sharing a reset time keep the fill-first ID order. The last observed
-// reset is also kept in auth metadata, which covers the time after a restart.
+// Credentials without a known future reset are tried first until a response completes
+// and teaches their window. A credential that answers without reporting a weekly window
+// has nothing that expires, so it is then spent last. Credentials that rank equally keep
+// the fill-first ID order. The last observed reset is also kept in auth metadata, which
+// covers the time after a restart.
 type SoonestResetSelector struct {
 	// nowFunc overrides the clock in tests.
 	nowFunc func() time.Time
@@ -51,27 +52,50 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 	if len(available) > 1 {
 		ordered := make([]*Auth, len(available))
 		copy(ordered, available)
-		resets := make(map[*Auth]time.Time, len(ordered))
+		ranks := make(map[*Auth]weeklyResetRank, len(ordered))
 		for _, candidate := range ordered {
-			resetAt, ok := WeeklyQuotaResetAt(candidate)
-			if !ok || !resetAt.After(now) {
-				// Unknown or already rolled over: rank first so the next response refreshes it.
-				resetAt = time.Time{}
-			}
-			resets[candidate] = resetAt
+			ranks[candidate] = rankWeeklyReset(candidate, now)
 		}
 		sort.SliceStable(ordered, func(i, j int) bool {
-			return resets[ordered[i]].Before(resets[ordered[j]])
+			a, b := ranks[ordered[i]], ranks[ordered[j]]
+			if a.tier != b.tier {
+				return a.tier < b.tier
+			}
+			return a.resetAt.Before(b.resetAt)
 		})
 		available = ordered
 	}
 	return available[0], nil
 }
 
-// WeeklyQuotaResetAt reports when the credential's weekly quota window next resets, as
+const (
+	weeklyResetTierProbe = iota // reset unknown or rolled over: try first to learn it
+	weeklyResetTierKnown        // known future reset: soonest first
+	weeklyResetTierNone         // answered without a weekly window: spend last
+)
+
+// weeklyResetRank orders candidates by tier, then by reset time within the known tier.
+type weeklyResetRank struct {
+	tier    int
+	resetAt time.Time
+}
+
+func rankWeeklyReset(auth *Auth, now time.Time) weeklyResetRank {
+	resetAt, ok := weeklyQuotaResetAt(auth)
+	switch {
+	case ok && resetAt.After(now):
+		return weeklyResetRank{tier: weeklyResetTierKnown, resetAt: resetAt}
+	case !ok && auth.weeklyResetProbed:
+		return weeklyResetRank{tier: weeklyResetTierNone}
+	default:
+		return weeklyResetRank{tier: weeklyResetTierProbe}
+	}
+}
+
+// weeklyQuotaResetAt reports when the credential's weekly quota window next resets, as
 // last observed in upstream response headers, or as persisted in auth metadata when no
 // response has been observed since the auth was loaded.
-func WeeklyQuotaResetAt(auth *Auth) (time.Time, bool) {
+func weeklyQuotaResetAt(auth *Auth) (time.Time, bool) {
 	if auth == nil {
 		return time.Time{}, false
 	}
@@ -136,6 +160,8 @@ func observedWeeklyQuotaResetAt(auth *Auth) (time.Time, bool) {
 		if errParse != nil || seconds <= 0 {
 			continue
 		}
+		// ObservedAt is when the response finished, so a reset derived from a relative
+		// header runs late by however long that response took.
 		return auth.Quota.ObservedAt.Add(time.Duration(seconds) * time.Second), true
 	}
 	return time.Time{}, false
@@ -153,17 +179,8 @@ func unixSignal(signals map[string]string, name string) (time.Time, bool) {
 	return time.Unix(seconds, 0), true
 }
 
-// quotaSignal looks up a signal by header name. Signals are stored under canonical
-// header keys, but names such as "7d_oi" are not canonicalizable, so fall back to a
-// case-insensitive scan.
+// quotaSignal looks up a signal by its canonical header name, the form signals are stored under.
 func quotaSignal(signals map[string]string, name string) (string, bool) {
-	if value, ok := signals[http.CanonicalHeaderKey(name)]; ok {
-		return strings.TrimSpace(value), true
-	}
-	for key, value := range signals {
-		if strings.EqualFold(key, name) {
-			return strings.TrimSpace(value), true
-		}
-	}
-	return "", false
+	value, ok := signals[name]
+	return strings.TrimSpace(value), ok
 }

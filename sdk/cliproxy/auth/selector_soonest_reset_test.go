@@ -83,6 +83,19 @@ func TestSoonestResetSelectorPick_ElapsedResetRanksFirst(t *testing.T) {
 	if got := pickSoonestReset(t, now, auths); got != "a-rolled-over" {
 		t.Fatalf("Pick() = %q, want a-rolled-over", got)
 	}
+
+	// Rolled-over and unknown resets rank equally, so ID order decides, not the stale time.
+	auths = []*Auth{
+		claudeWeeklyResetAuth("c-rolled-over-earlier", now.Add(-2*time.Hour)),
+		{ID: "b-unknown", Provider: "claude", Status: StatusActive},
+		claudeWeeklyResetAuth("a-rolled-over", now.Add(-time.Minute)),
+	}
+	if got := pickSoonestReset(t, now, auths); got != "a-rolled-over" {
+		t.Fatalf("Pick() = %q, want a-rolled-over", got)
+	}
+	if got := pickSoonestReset(t, now, auths[:2]); got != "b-unknown" {
+		t.Fatalf("Pick() = %q, want b-unknown", got)
+	}
 }
 
 func TestSoonestResetSelectorPick_TiesKeepFillFirstOrder(t *testing.T) {
@@ -146,11 +159,6 @@ func TestWeeklyQuotaResetAt(t *testing.T) {
 			want:    time.Unix(1793462400, 0), wantOK: true,
 		},
 		{
-			name:    "claude header stored under non-canonical casing",
-			signals: map[string]string{"anthropic-ratelimit-unified-7d-reset": "1793462400"},
-			want:    time.Unix(1793462400, 0), wantOK: true,
-		},
-		{
 			name: "codex weekly primary window",
 			signals: map[string]string{
 				"X-Codex-Primary-Window-Minutes": "10080",
@@ -191,14 +199,14 @@ func TestWeeklyQuotaResetAt(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := WeeklyQuotaResetAt(&Auth{Quota: QuotaState{ObservedAt: observedAt, Signals: tt.signals}})
+			got, ok := weeklyQuotaResetAt(&Auth{Quota: QuotaState{ObservedAt: observedAt, Signals: tt.signals}})
 			if ok != tt.wantOK || !got.Equal(tt.want) {
-				t.Fatalf("WeeklyQuotaResetAt() = %v, %v; want %v, %v", got, ok, tt.want, tt.wantOK)
+				t.Fatalf("weeklyQuotaResetAt() = %v, %v; want %v, %v", got, ok, tt.want, tt.wantOK)
 			}
 		})
 	}
-	if _, ok := WeeklyQuotaResetAt(nil); ok {
-		t.Fatal("WeeklyQuotaResetAt(nil) reported a reset")
+	if _, ok := weeklyQuotaResetAt(nil); ok {
+		t.Fatal("weeklyQuotaResetAt(nil) reported a reset")
 	}
 }
 
@@ -279,6 +287,48 @@ func TestManagerSoonestResetLearnsResetTimesFromResponses(t *testing.T) {
 	}
 }
 
+// A credential that never reports a weekly window (an API key, say) is probed once and then
+// spent last, so it cannot starve the credential whose quota is about to expire.
+func TestManagerSoonestResetSpendsCredentialWithoutWeeklyWindowLast(t *testing.T) {
+	const model = "soonest-reset-silent-model"
+	manager := NewManager(nil, &SoonestResetSelector{}, nil)
+	manager.SetRetryConfig(0, 0, 0)
+	silent, weekly := "a-silent-"+t.Name(), "b-weekly-"+t.Name()
+	registerSoonestResetAuths(t, manager, model,
+		&Auth{ID: silent, Provider: "claude", Status: StatusActive},
+		&Auth{ID: weekly, Provider: "claude", Status: StatusActive},
+	)
+	resetAt := time.Now().Add(2 * time.Hour)
+	manager.RegisterExecutor(&mockCustomErrorExecutor{
+		identifier: "claude",
+		executeFn: func(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			if auth.ID == weekly {
+				internallogging.SetResponseHeaders(ctx, http.Header{
+					"Anthropic-Ratelimit-Unified-7d-Reset": []string{strconv.FormatInt(resetAt.Unix(), 10)},
+				})
+			}
+			return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+		},
+	})
+
+	// A success that skips quota observation (token counting) teaches nothing, so it must
+	// not mark the weekly credential as one that reports no window.
+	manager.MarkResult(context.Background(), Result{AuthID: weekly, Provider: "claude", Model: model, Success: true, SkipQuotaObservation: true})
+
+	// ID order probes a-silent, which answers without a window; b-weekly is probed next and
+	// keeps the traffic from then on.
+	want := []string{silent, weekly, weekly, weekly}
+	for i, wantID := range want {
+		resp, errExecute := manager.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+		if errExecute != nil {
+			t.Fatalf("Execute #%d error = %v", i, errExecute)
+		}
+		if got := string(resp.Payload); got != wantID {
+			t.Fatalf("Execute #%d routed to %q, want %q", i, got, wantID)
+		}
+	}
+}
+
 // Without session affinity the selector must rank the candidates the manager validated per
 // resolved upstream model, not re-check them against a stale cooldown on the route alias.
 func TestManagerSoonestResetIgnoresCooldownOnRemappedAlias(t *testing.T) {
@@ -322,19 +372,19 @@ func TestWeeklyQuotaResetAtFallsBackToPersistedMetadata(t *testing.T) {
 
 	persisted := time.Unix(1793462400, 0)
 	auth := &Auth{Metadata: map[string]any{WeeklyQuotaResetMetadataKey: persisted.UTC().Format(time.RFC3339)}}
-	if got, ok := WeeklyQuotaResetAt(auth); !ok || !got.Equal(persisted) {
-		t.Fatalf("WeeklyQuotaResetAt() = %v, %v; want persisted %v", got, ok, persisted)
+	if got, ok := weeklyQuotaResetAt(auth); !ok || !got.Equal(persisted) {
+		t.Fatalf("weeklyQuotaResetAt() = %v, %v; want persisted %v", got, ok, persisted)
 	}
 
 	observed := persisted.Add(7 * 24 * time.Hour)
 	auth.Quota.Signals = map[string]string{"Anthropic-Ratelimit-Unified-7d-Reset": strconv.FormatInt(observed.Unix(), 10)}
-	if got, ok := WeeklyQuotaResetAt(auth); !ok || !got.Equal(observed) {
-		t.Fatalf("WeeklyQuotaResetAt() = %v, %v; want observed %v to win", got, ok, observed)
+	if got, ok := weeklyQuotaResetAt(auth); !ok || !got.Equal(observed) {
+		t.Fatalf("weeklyQuotaResetAt() = %v, %v; want observed %v to win", got, ok, observed)
 	}
 
 	malformed := &Auth{Metadata: map[string]any{WeeklyQuotaResetMetadataKey: "next tuesday"}}
-	if _, ok := WeeklyQuotaResetAt(malformed); ok {
-		t.Fatal("WeeklyQuotaResetAt() accepted malformed persisted metadata")
+	if _, ok := weeklyQuotaResetAt(malformed); ok {
+		t.Fatal("weeklyQuotaResetAt() accepted malformed persisted metadata")
 	}
 }
 

@@ -1373,6 +1373,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if auth.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now) {
 				syncWeeklyQuotaResetMetadata(auth)
 			}
+			if result.Success {
+				auth.weeklyResetProbed = true
+			}
 			if modelState != nil {
 				modelState.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
 			}
