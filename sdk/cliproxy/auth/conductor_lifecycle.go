@@ -379,6 +379,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	}
 	auth.Success = existing.Success
 	auth.Failed = existing.Failed
+	auth.weeklyResetProbedAt = existing.weeklyResetProbedAt
 	auth.recentRequests = existing.recentRequests
 	if auth.Generation <= existing.Generation {
 		auth.Generation = existing.Generation + 1

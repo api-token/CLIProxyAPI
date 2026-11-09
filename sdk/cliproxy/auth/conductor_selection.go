@@ -80,6 +80,17 @@ func isBuiltInSelector(selector Selector) bool {
 	}
 }
 
+// selectorTrustsManagerAvailability reports whether the selector ranks the candidates the
+// manager already validated per resolved upstream model, rather than re-checking them
+// against the requested route model. SoonestResetSelector is included without joining the
+// scheduler fast path, which has no reset-time ordering.
+func selectorTrustsManagerAvailability(selector Selector) bool {
+	if _, soonestReset := selector.(*SoonestResetSelector); soonestReset {
+		return true
+	}
+	return isBuiltInSelector(selector)
+}
+
 type requiredAuthKindContextKey struct{}
 type credentialPolicyContextKey struct{}
 
@@ -973,7 +984,7 @@ func (m *Manager) availableAuthsForSelector(ctx context.Context, selector Select
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
-	if isBuiltInSelector(selector) {
+	if selectorTrustsManagerAvailability(selector) {
 		return ""
 	}
 	return routeModel
@@ -981,7 +992,7 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 
 func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
-	if !isBuiltInSelector(selector) {
+	if !selectorTrustsManagerAvailability(selector) {
 		if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
 			return ctx
 		}
@@ -2352,7 +2363,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 					errPick = &Error{Code: "auth_not_found", Message: "no auth available"}
 				}
 			}
-			if isBuiltInSelector(selector) {
+			if selectorTrustsManagerAvailability(selector) {
 				errPick = restoreModelCooldownErrorModel(errPick, model)
 			}
 			m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errPick)
@@ -2825,7 +2836,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 					errPick = &Error{Code: "auth_not_found", Message: "no auth available"}
 				}
 			}
-			if isBuiltInSelector(selector) {
+			if selectorTrustsManagerAvailability(selector) {
 				errPick = restoreModelCooldownErrorModel(errPick, model)
 			}
 			m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errPick)
